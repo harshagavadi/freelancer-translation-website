@@ -1,4 +1,4 @@
-import { create } from 'zustand';
+'''import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
 export interface Currency {
@@ -721,95 +721,131 @@ export const useStore = create<AppState>()(
       depositFunds: async (amount: number, paymentMethod: string) => {
         const user = get().user;
         if (!user || amount <= 0) return false;
-        
-        // Calculate platform commission (5% for clients, 0% for translators)
+
         const platformFee = user.type === 'client' ? amount * 0.05 : 0;
         const totalCharged = amount + platformFee;
-        
+
+        // Convert to smallest currency unit (paise for INR)
+        const amountInSmallestUnit = Math.round(get().convertAmount(totalCharged, 'USD', 'INR') * 100);
+        const commissionInSmallestUnit = Math.round(get().convertAmount(platformFee, 'USD', 'INR') * 100);
+
         try {
-          // Convert to smallest currency unit (paise for INR, cents for USD)
-          const amountInSmallestUnit = user.currency === 'INR' 
-            ? Math.round(totalCharged * get().convertAmount(1, 'USD', 'INR') * 100)
-            : Math.round(totalCharged * 100);
-          
-          // Razorpay Order Creation (simulation)
-          const razorpayOrderId = `order_${Date.now()}`;
-          const razorpayPaymentId = `pay_${Date.now()}`;
-          
-          console.log('🔐 Razorpay Payment Initiated:', {
-            amount: amountInSmallestUnit,
-            currency: user.currency,
-            keyId: RAZORPAY_CONFIG.keyId,
-            orderId: razorpayOrderId,
+          // 1. Create Razorpay Order
+          const orderResponse = await fetch('/api/razorpay/order', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              amount: amountInSmallestUnit,
+              currency: 'INR',
+              notes: {
+                user_id: user.id,
+                commission: commissionInSmallestUnit,
+              },
+            }),
           });
-          
-          // Simulate Razorpay payment processing
-          await new Promise(resolve => setTimeout(resolve, 1500));
-          
-          // Create main transaction
-          const transaction: Transaction = {
-            id: `txn_${Date.now()}`,
-            userId: user.id,
-            type: 'deposit',
-            amount,
-            status: 'completed',
-            description: `Deposit via ${paymentMethod}${user.type === 'client' ? ' (incl. 5% platform fee)' : ''}`,
-            timestamp: new Date().toISOString(),
-            paymentMethod,
-            transactionFee: platformFee > 0 ? platformFee : undefined,
-            razorpayOrderId,
-            razorpayPaymentId,
-            commissionAmount: platformFee,
+
+          if (!orderResponse.ok) throw new Error('Failed to create Razorpay order');
+          const order = await orderResponse.json();
+
+          // 2. Open Razorpay Checkout
+          const options = {
+            key: RAZORPAY_CONFIG.keyId,
+            amount: order.amount,
+            currency: order.currency,
+            name: 'Lingua Solutions India',
+            description: 'Wallet Deposit',
+            order_id: order.id,
+            handler: async (response: any) => {
+              // 3. Capture Payment and Process on Success
+              const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = response;
+
+              const captureResponse = await fetch('/api/razorpay/capture', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  payment_id: razorpay_payment_id,
+                  order_id: razorpay_order_id,
+                  signature: razorpay_signature,
+                  amount: order.amount,
+                  commission: commissionInSmallestUnit,
+                }),
+              });
+
+              if (!captureResponse.ok) throw new Error('Payment capture failed');
+
+              // 4. Update state after successful payment
+              const transaction: Transaction = {
+                id: `txn_${Date.now()}`,
+                userId: user.id,
+                type: 'deposit',
+                amount,
+                status: 'completed',
+                description: `Deposit via ${paymentMethod}`,
+                timestamp: new Date().toISOString(),
+                paymentMethod,
+                transactionFee: platformFee > 0 ? platformFee : undefined,
+                razorpayOrderId: razorpay_order_id,
+                razorpayPaymentId: razorpay_payment_id,
+                commissionAmount: platformFee,
+              };
+
+              if (platformFee > 0) {
+                const commissionTransaction: Transaction = {
+                  id: `comm_${Date.now()}`,
+                  userId: 'platform',
+                  type: 'commission',
+                  amount: platformFee,
+                  status: 'completed',
+                  description: `Platform commission from ${user.name}`,
+                  timestamp: new Date().toISOString(),
+                  paymentMethod: 'razorpay_auto_credit',
+                  razorpayOrderId: razorpay_order_id,
+                  razorpayPaymentId: razorpay_payment_id,
+                };
+
+                set(state => ({
+                  user: state.user ? { ...state.user, walletBalance: state.user.walletBalance + amount } : null,
+                  transactions: [...state.transactions, transaction, commissionTransaction],
+                  platformCommissionBalance: state.platformCommissionBalance + platformFee,
+                }));
+              } else {
+                 set(state => ({
+                  user: state.user ? { ...state.user, walletBalance: state.user.walletBalance + amount } : null,
+                  transactions: [...state.transactions, transaction],
+                }));
+              }
+             
+              get().addNotification({
+                userId: user.id,
+                type: 'status_change',
+                title: 'Funds Deposited!',
+                message: `Successfully added ${get().formatCurrency(amount)} to your wallet.`,
+              });
+            },
+            prefill: {
+              name: user.name,
+              email: user.email,
+            },
+            notes: {
+              userId: user.id,
+            },
+            theme: {
+              color: '#4F46E5',
+            },
           };
           
-          // Automatically credit commission to platform Razorpay account
-          if (platformFee > 0) {
-            const commissionTransaction: Transaction = {
-              id: `comm_${Date.now()}`,
-              userId: 'platform',
-              type: 'commission',
-              amount: platformFee,
-              status: 'completed',
-              description: `Platform commission from ${user.name} (${user.email})`,
-              timestamp: new Date().toISOString(),
-              paymentMethod: 'razorpay_auto_credit',
-              razorpayOrderId,
-              razorpayPaymentId,
-            };
-            
-            // Update platform commission balance
-            set(state => ({
-              user: state.user ? { ...state.user, walletBalance: state.user.walletBalance + amount } : null,
-              transactions: [...state.transactions, transaction, commissionTransaction],
-              platformCommissionBalance: state.platformCommissionBalance + platformFee,
-            }));
-            
-            console.log(`✅ Commission Auto-Credited to Razorpay Account:`, {
-              amount: platformFee,
-              orderId: razorpayOrderId,
-              paymentId: razorpayPaymentId,
-              platformAccount: RAZORPAY_CONFIG.platformAccount,
-              timestamp: new Date().toISOString(),
-            });
-          } else {
-            set(state => ({
-              user: state.user ? { ...state.user, walletBalance: state.user.walletBalance + amount } : null,
-              transactions: [...state.transactions, transaction]
-            }));
-          }
-          
-          get().addNotification({
-            userId: user.id,
-            type: 'status_change',
-            title: 'Funds Deposited via Razorpay',
-            message: user.type === 'client' 
-              ? `Successfully added ${get().formatCurrency(amount)} to your wallet via Razorpay (Total charged: ${get().formatCurrency(totalCharged)} with 5% platform fee). Order ID: ${razorpayOrderId}`
-              : `Successfully added ${get().formatCurrency(amount)} to your wallet via Razorpay. Payment ID: ${razorpayPaymentId}`,
-          });
+          const rzp = new (window as any).Razorpay(options);
+          rzp.open();
           
           return true;
         } catch (error) {
           console.error('Razorpay payment failed:', error);
+          get().addNotification({
+            userId: user.id,
+            type: 'status_change',
+            title: 'Deposit Failed',
+            message: 'There was an error processing your deposit. Please try again.',
+          });
           return false;
         }
       },
@@ -821,7 +857,7 @@ export const useStore = create<AppState>()(
         const transactionFee = amount * 0.02; // 2% fee
         const amountReceived = amount - transactionFee; // What user actually receives
         
-        if (user.walletBalance < amount) {
+        if (get().getWalletBalance() < amount) {
           get().addNotification({
             userId: user.id,
             type: 'status_change',
@@ -830,28 +866,29 @@ export const useStore = create<AppState>()(
           });
           return false;
         }
-        
+
+        // Convert to smallest currency unit for Razorpay payout
+        const amountInSmallestUnit = Math.round(get().convertAmount(amountReceived, 'USD', 'INR') * 100);
+
         try {
-          // Convert to smallest currency unit for Razorpay payout
-          const amountInSmallestUnit = user.currency === 'INR'
-            ? Math.round(amountReceived * get().convertAmount(1, 'USD', 'INR') * 100)
-            : Math.round(amountReceived * 100);
-          
-          // Razorpay Payout Creation (simulation)
-          const razorpayPayoutId = `payout_${Date.now()}`;
-          const razorpayFundAccountId = `fa_${user.id}`;
-          
-          console.log('💸 Razorpay Payout Initiated:', {
-            amount: amountInSmallestUnit,
-            currency: user.currency,
-            fundAccountId: razorpayFundAccountId,
-            payoutId: razorpayPayoutId,
-            method: paymentMethod,
+           // 1. Create Razorpay Payout
+          const payoutResponse = await fetch('/api/razorpay/payout', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              amount: amountInSmallestUnit,
+              currency: 'INR',
+              method: paymentMethod,
+              userId: user.id,
+              // In a real app, you'd get fund_account_id from user's saved bank details
+              fund_account_id: `fa_${user.id}_${paymentMethod}`, 
+            }),
           });
-          
-          // Simulate Razorpay payout processing
-          await new Promise(resolve => setTimeout(resolve, 1500));
-          
+
+          if (!payoutResponse.ok) throw new Error('Failed to create Razorpay payout');
+          const payout = await payoutResponse.json();
+
+          // 2. Update state after successful payout
           const transaction: Transaction = {
             id: `txn_${Date.now()}`,
             userId: user.id,
@@ -862,7 +899,7 @@ export const useStore = create<AppState>()(
             timestamp: new Date().toISOString(),
             paymentMethod,
             transactionFee,
-            razorpayPaymentId: razorpayPayoutId,
+            razorpayPaymentId: payout.id,
           };
           
           // Commission from withdrawal fee also goes to platform
@@ -875,7 +912,7 @@ export const useStore = create<AppState>()(
             description: `Withdrawal fee commission from ${user.name}`,
             timestamp: new Date().toISOString(),
             paymentMethod: 'razorpay_auto_credit',
-            razorpayPaymentId: razorpayPayoutId,
+            razorpayPaymentId: payout.id,
           };
           
           set(state => ({
@@ -884,22 +921,22 @@ export const useStore = create<AppState>()(
             platformCommissionBalance: state.platformCommissionBalance + transactionFee,
           }));
           
-          console.log(`✅ Withdrawal Fee Credited to Razorpay Account:`, {
-            amount: transactionFee,
-            payoutId: razorpayPayoutId,
-            platformAccount: RAZORPAY_CONFIG.platformAccount,
-          });
-          
           get().addNotification({
             userId: user.id,
             type: 'status_change',
             title: 'Withdrawal Successful',
-            message: `Withdrew ${get().formatCurrency(amount)} via Razorpay. You'll receive ${get().formatCurrency(amountReceived)} (2% fee: ${get().formatCurrency(transactionFee)}). Payout ID: ${razorpayPayoutId}`,
+            message: `Withdrew ${get().formatCurrency(amount)}. You'll receive ${get().formatCurrency(amountReceived)}.`,
           });
           
           return true;
         } catch (error) {
           console.error('Razorpay withdrawal failed:', error);
+           get().addNotification({
+            userId: user.id,
+            type: 'status_change',
+            title: 'Withdrawal Failed',
+            message: 'There was an error processing your withdrawal. Please try again.',
+          });
           return false;
         }
       },
@@ -981,7 +1018,21 @@ export const useStore = create<AppState>()(
       
       getWalletBalance: () => {
         const user = get().user;
-        return user?.walletBalance || 0;
+        if (!user) return 0;
+
+        const balance = get().getUserTransactions().reduce((acc, t) => {
+            switch (t.type) {
+                case 'deposit':
+                case 'earning':
+                    return acc + t.amount;
+                case 'withdrawal':
+                case 'payment':
+                    return acc - t.amount;
+                default:
+                    return acc;
+            }
+        }, 0);
+        return balance;
       },
       
       // Currency actions
@@ -1050,3 +1101,4 @@ export const useStore = create<AppState>()(
     }
   )
 );
+''
